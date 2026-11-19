@@ -1,0 +1,970 @@
+---
+title: "Risikovurdering CPO 2026"
+author: "Anders Skyrud Danielsen"
+date: "2026-11-17"
+output: html_document
+---
+
+# Oppsett
+
+Denne delen laster pakkene, angir filbaner og samler analyseforutsetningene. Kontrollscenarioet ender på `r control_final_multiplier` ganger forventet innenlandssmitte og ukjent smittested, mens alle tre komponentene i det ugunstige scenarioet ender på `r adverse_final_multiplier` ganger referansebanen.
+
+```{r setup, include=FALSE}
+
+Sys.setlocale(category = "LC_ALL", locale = "Norwegian")
+.libPaths(c("U:/library", .libPaths()))
+
+pacman::p_load(
+  tidyverse,
+  tidylog,
+  MASS,
+  readxl,
+  scales,
+  knitr,
+  patchwork
+)
+
+options(scipen = 999)
+set.seed(030389)
+
+theme_set(
+  theme_classic(base_size = 11) +
+    theme(
+      text = element_text(colour = "#222222"),
+      axis.text = element_text(colour = "#222222"),
+      strip.text = element_text(face = "bold", colour = "#222222"),
+      legend.position = "bottom"
+    )
+)
+
+data_path <- paste0(
+  "I:/MSIS_UtenPersonid/Resistente_mikrober/",
+  "Risikovurdering CPO 2026/",
+  "2026-11-10_CPO-risikovurdering.csv"
+)
+
+population_projection_path <- paste0(
+  "I:/MSIS_UtenPersonid/Resistente_mikrober/",
+  "Risikovurdering CPO 2026/",
+  "Befolkning.xlsx"
+)
+
+esbl_path <- paste0(
+  "I:/MSIS_UtenPersonid/Resistente_mikrober/",
+  "Risikovurdering CPO 2026/",
+  "ESBL_i_urin.xlsx"
+)
+
+output_path <- paste0(
+  "I:/MSIS_UtenPersonid/Resistente_mikrober/",
+  "Risikovurdering CPO 2026/"
+)
+
+first_observed_date <- as.Date("2013-01-01")
+last_complete_year <- 2025
+first_projection_year <- 2025
+n_future_years <- 15
+n_sim <- 5000
+prediction_interval <- 0.95
+lower_probability <- (1 - prediction_interval) / 2
+upper_probability <- 1 - lower_probability
+
+control_final_multiplier <- 0.50
+adverse_final_multiplier <- 2.00
+
+fhi_colours <- c(
+  "Historisk fortsettelse" = "#40436d",
+  "Kontrollscenario" = "#179463",
+  "Ugunstig scenario" = "#d74b46"
+)
+
+country_colours <- c(
+  "Norge, observert" = "#222222",
+  "Norge, modelltilpasset" = "#65a9c5",
+  "Norge, historisk fortsettelse" = fhi_colours[["Historisk fortsettelse"]],
+  "Danmark, observert" = "#ec7c73",
+  "ESBL E. coli, Norge" = "#7a5195",
+  "ESBL K. pneumoniae, Norge" = "#ef5675"
+)
+```
+
+# Klargjør kvartalsdata
+
+Dataene leses inn på kvartalsnivå. Reisevariabelen er oppgitt i millioner reiser per kvartal og omregnes til antall reiser.
+
+```{r prepare-quarterly-data}
+dat_quarter <- read_csv2(
+  data_path,
+  locale = locale(encoding = "latin1")
+) |>
+  mutate(
+    date = seq.Date(
+      from = first_observed_date,
+      by = "quarter",
+      length.out = n()
+    ),
+    year = lubridate::year(date),
+    travel_n = travel_all * 1000000,
+    cpo_modelled_total =
+      CPO_smittested_Norge +
+      CPO_smittested_øvrig_utland +
+      CPO_smittested_ukjent
+  )
+```
+
+# Aggreger til årsdata
+
+Tilfeller og reiser summeres innen kalenderår, mens befolkningen settes til gjennomsnittlig kvartalsbefolkning. Det ufullstendige året 2026 vises som observert, men inngår ikke i modelltilpasningen.
+
+```{r prepare-annual-data}
+
+dat_year_observed <- dat_quarter |>
+  group_by(year) |>
+  summarise(
+    CPO_smittested_Norge = sum(CPO_smittested_Norge),
+    CPO_smittested_øvrig_utland = sum(CPO_smittested_øvrig_utland),
+    CPO_smittested_ukjent = sum(CPO_smittested_ukjent),
+    cpo_modelled_total = sum(cpo_modelled_total),
+    population = mean(population),
+    travel_n = sum(travel_n),
+    observed_quarters = n(),
+    .groups = "drop"
+  ) |>
+  mutate(
+    date = as.Date(paste0(year, "-01-01"))
+  ) %>% 
+  filter(year != 2026)
+
+dat_year_model <- dat_year_observed |>
+  filter(year <= last_complete_year) |>
+  mutate(
+    t_year = row_number(),
+    t_year_c = t_year - max(t_year)
+  )
+```
+
+# Les inn befolkningsframskriving
+
+Befolkningsframskrivingen leses fra det vedlagte Excel-arket. Befolkningen i første prognoseår hentes fra observasjonsdataene, befolkningen i 2026 settes til 5 633 770, og verdiene fra 2027 og framover hentes fra arket.
+
+```{r population-projection}
+population_projection <- read_excel(
+  population_projection_path,
+  sheet = "14740",
+  col_names = c("year", "population"),
+  skip = 1
+) |>
+  mutate(
+    year = as.integer(year),
+    population = as.numeric(population)
+  )
+
+population_for_forecast <- bind_rows(
+  dat_year_observed |>
+    filter(year == first_projection_year) |>
+    dplyr::select(year, population),
+  tibble(
+    year = 2026,
+    population = 5633770
+  ),
+  population_projection
+) |>
+  distinct(year, .keep_all = TRUE) |>
+  arrange(year)
+```
+
+# Lag datasett for framskrivingsperioden
+
+Framskrivingsperioden starter i `r first_projection_year` og dekker `r n_future_years` år. Befolkning kobles på fra befolkningsframskrivingen.
+
+```{r future-data}
+future_year <- tibble(
+  year = first_projection_year + 0:(n_future_years - 1),
+  t_year = max(dat_year_model$t_year) + year - last_complete_year,
+  t_year_c = year - last_complete_year,
+  date = as.Date(paste0(year, "-01-01"))
+) |>
+  left_join(
+    population_for_forecast,
+    by = "year"
+  )
+```
+
+# Tilpass hovedmodellene
+
+Hovedanalysen bruker negativ-binomialregresjon med identity-link og et kvadratisk tidsledd. Modellene estimerer årlige antall direkte; befolkningen brukes først etter prediksjon til å uttrykke resultatene som rater.
+
+```{r fit-main-models}
+m_year_abroad <- glm.nb(
+  CPO_smittested_øvrig_utland ~
+    t_year_c + I(t_year_c^2),
+  data = dat_year_model,
+  link = "identity",
+  init.theta = 1,
+  control = glm.control(maxit = 100)
+)
+
+m_year_domestic <- glm.nb(
+  CPO_smittested_Norge ~
+    t_year_c + I(t_year_c^2),
+  data = dat_year_model,
+  link = "identity",
+  init.theta = 1,
+  control = glm.control(maxit = 100)
+)
+
+m_year_unknown <- glm.nb(
+  CPO_smittested_ukjent ~
+    t_year_c + I(t_year_c^2),
+  data = dat_year_model,
+  link = "identity",
+  init.theta = 1,
+  control = glm.control(maxit = 100)
+)
+```
+
+# Lag scenarioene
+
+Referansebanen viderefører modellert utvikling. Kontrollscenarioet demper innenlandssmitte og ukjent smittested gradvis til `r control_final_multiplier` av referansebanen. Det ugunstige scenarioet øker alle tre komponentene gradvis til `r adverse_final_multiplier` av referansebanen.
+
+```{r create-scenarios}
+control_multiplier_year <- seq(
+  from = 1,
+  to = control_final_multiplier,
+  length.out = n_future_years
+)
+
+adverse_multiplier_year <- seq(
+  from = 1,
+  to = adverse_final_multiplier,
+  length.out = n_future_years
+)
+
+future_year_scenarios <- bind_rows(
+  future_year |>
+    mutate(
+      scenario = "Historisk fortsettelse",
+      abroad_multiplier = 1,
+      domestic_multiplier = 1,
+      unknown_multiplier = 1
+    ),
+  future_year |>
+    mutate(
+      scenario = "Kontrollscenario",
+      abroad_multiplier = 1,
+      domestic_multiplier = control_multiplier_year,
+      unknown_multiplier = control_multiplier_year
+    ),
+  future_year |>
+    mutate(
+      scenario = "Ugunstig scenario",
+      abroad_multiplier = adverse_multiplier_year,
+      domestic_multiplier = adverse_multiplier_year,
+      unknown_multiplier = adverse_multiplier_year
+    )
+)
+```
+
+# Beregn punktestimater og standardfeil
+
+Prediksjonene beregnes på responskalaen. Standardfeilen fra hver modell brukes som usikkerhet rundt forventet antall før framtidige tellinger simuleres fra negativ-binomialfordelingen.
+
+```{r point-predictions}
+pred_abroad <- predict(
+  m_year_abroad,
+  newdata = future_year_scenarios |>
+    transmute(t_year_c),
+  type = "response",
+  se.fit = TRUE
+)
+
+pred_domestic <- predict(
+  m_year_domestic,
+  newdata = future_year_scenarios |>
+    transmute(t_year_c),
+  type = "response",
+  se.fit = TRUE
+)
+
+pred_unknown <- predict(
+  m_year_unknown,
+  newdata = future_year_scenarios |>
+    transmute(t_year_c),
+  type = "response",
+  se.fit = TRUE
+)
+
+annual_point_predictions <- future_year_scenarios |>
+  mutate(
+    abroad_unmodified = pmax(as.numeric(pred_abroad$fit), 0.001),
+    abroad_se_unmodified = as.numeric(pred_abroad$se.fit),
+    abroad = pmax(abroad_unmodified * abroad_multiplier, 0.001),
+    abroad_se = abroad_se_unmodified * abroad_multiplier,
+    domestic_unmodified = pmax(as.numeric(pred_domestic$fit), 0.001),
+    domestic_se_unmodified = as.numeric(pred_domestic$se.fit),
+    domestic = pmax(domestic_unmodified * domestic_multiplier, 0.001),
+    domestic_se = domestic_se_unmodified * domestic_multiplier,
+    unknown_unmodified = pmax(as.numeric(pred_unknown$fit), 0.001),
+    unknown_se_unmodified = as.numeric(pred_unknown$se.fit),
+    unknown = pmax(unknown_unmodified * unknown_multiplier, 0.001),
+    unknown_se = unknown_se_unmodified * unknown_multiplier,
+    total = abroad + domestic + unknown,
+    total_rate_per_100k = total / population * 100000
+  )
+```
+
+# Simuler prediksjonsintervaller
+
+For hvert framtidig år trekkes først en forventningsverdi fra en normalfordeling rundt modellprediksjonen. Deretter trekkes framtidige tellinger fra den tilhørende negativ-binomialfordelingen.
+
+```{r simulate-prediction-intervals}
+simulate_row <- function(
+  abroad,
+  abroad_se,
+  domestic,
+  domestic_se,
+  unknown,
+  unknown_se,
+  theta_abroad,
+  theta_domestic,
+  theta_unknown,
+  n_sim
+) {
+  mu_abroad <- pmax(
+    rnorm(n_sim, mean = abroad, sd = abroad_se),
+    0.001
+  )
+
+  mu_domestic <- pmax(
+    rnorm(n_sim, mean = domestic, sd = domestic_se),
+    0.001
+  )
+
+  mu_unknown <- pmax(
+    rnorm(n_sim, mean = unknown, sd = unknown_se),
+    0.001
+  )
+
+  sim_abroad <- rnbinom(
+    n_sim,
+    mu = mu_abroad,
+    size = theta_abroad
+  )
+
+  sim_domestic <- rnbinom(
+    n_sim,
+    mu = mu_domestic,
+    size = theta_domestic
+  )
+
+  sim_unknown <- rnbinom(
+    n_sim,
+    mu = mu_unknown,
+    size = theta_unknown
+  )
+
+  tibble(
+    abroad_sim = sim_abroad,
+    domestic_sim = sim_domestic,
+    unknown_sim = sim_unknown,
+    total_sim = sim_abroad + sim_domestic + sim_unknown
+  )
+}
+
+simulation_results <- pmap(
+  annual_point_predictions |>
+    dplyr::select(
+      abroad,
+      abroad_se,
+      domestic,
+      domestic_se,
+      unknown,
+      unknown_se
+    ),
+  ~ simulate_row(
+    abroad = ..1,
+    abroad_se = ..2,
+    domestic = ..3,
+    domestic_se = ..4,
+    unknown = ..5,
+    unknown_se = ..6,
+    theta_abroad = m_year_abroad$theta,
+    theta_domestic = m_year_domestic$theta,
+    theta_unknown = m_year_unknown$theta,
+    n_sim = n_sim
+  )
+)
+
+annual_predictions <- annual_point_predictions |>
+  mutate(
+    simulations = simulation_results
+  ) |>
+  mutate(
+    abroad_lower = map_dbl(
+      simulations,
+      ~ quantile(.x$abroad_sim, lower_probability)
+    ),
+    abroad_upper = map_dbl(
+      simulations,
+      ~ quantile(.x$abroad_sim, upper_probability)
+    ),
+    domestic_lower = map_dbl(
+      simulations,
+      ~ quantile(.x$domestic_sim, lower_probability)
+    ),
+    domestic_upper = map_dbl(
+      simulations,
+      ~ quantile(.x$domestic_sim, upper_probability)
+    ),
+    unknown_lower = map_dbl(
+      simulations,
+      ~ quantile(.x$unknown_sim, lower_probability)
+    ),
+    unknown_upper = map_dbl(
+      simulations,
+      ~ quantile(.x$unknown_sim, upper_probability)
+    ),
+    total_lower = map_dbl(
+      simulations,
+      ~ quantile(.x$total_sim, lower_probability)
+    ),
+    total_upper = map_dbl(
+      simulations,
+      ~ quantile(.x$total_sim, upper_probability)
+    ),
+    rate_lower_per_100k = total_lower / population * 100000,
+    rate_upper_per_100k = total_upper / population * 100000
+  )
+```
+
+# Hovedfigur for scenarioene
+
+Figuren viser totalantallet i et stort øvre panel og de tre smittestedene i mindre paneler under. Historisk fortsettelse er prioritert med en tykkere linje som tegnes oppå de to scenarioene.
+
+```{r main-scenario-figure, fig.width=12, fig.height=9}
+observed_year_long <- dat_year_observed |>
+  transmute(
+    date,
+    Totalt = cpo_modelled_total,
+    `Smitte ervervet i Norge` = CPO_smittested_Norge,
+    `Smitte ervervet i øvrig utland` = CPO_smittested_øvrig_utland,
+    `Ukjent smittested` = CPO_smittested_ukjent
+  ) |>
+  pivot_longer(
+    cols = -date,
+    names_to = "component",
+    values_to = "cases"
+  )
+
+predicted_year_long <- bind_rows(
+  annual_predictions |>
+    transmute(
+      scenario,
+      date,
+      component = "Totalt",
+      estimate = total,
+      lower = total_lower,
+      upper = total_upper
+    ),
+  annual_predictions |>
+    transmute(
+      scenario,
+      date,
+      component = "Smitte ervervet i Norge",
+      estimate = domestic,
+      lower = domestic_lower,
+      upper = domestic_upper
+    ),
+  annual_predictions |>
+    transmute(
+      scenario,
+      date,
+      component = "Smitte ervervet i øvrig utland",
+      estimate = abroad,
+      lower = abroad_lower,
+      upper = abroad_upper
+    ),
+  annual_predictions |>
+    transmute(
+      scenario,
+      date,
+      component = "Ukjent smittested",
+      estimate = unknown,
+      lower = unknown_lower,
+      upper = unknown_upper
+    )
+) |>
+  mutate(
+    scenario = factor(
+      scenario,
+      levels = names(fhi_colours)
+    )
+  )
+
+scenario_plot <- function(observed_data, predicted_data, use_facets = FALSE) {
+  p <- ggplot() +
+    geom_ribbon(
+      data = predicted_data,
+      aes(
+        x = date,
+        ymin = lower,
+        ymax = upper,
+        fill = scenario,
+        group = scenario
+      ),
+      alpha = 0.12,
+      colour = NA,
+      show.legend = FALSE
+    ) +
+    geom_line(
+      data = observed_data,
+      aes(x = date, y = cases),
+      colour = "#222222",
+      linewidth = 0.8
+    ) +
+    geom_line(
+      data = predicted_data |>
+        filter(scenario != "Historisk fortsettelse"),
+      aes(
+        x = date,
+        y = estimate,
+        colour = scenario,
+        group = scenario
+      ),
+      linewidth = 0.75
+    ) +
+    geom_line(
+      data = predicted_data |>
+        filter(scenario == "Historisk fortsettelse"),
+      aes(
+        x = date,
+        y = estimate,
+        colour = scenario,
+        group = scenario
+      ),
+      linewidth = 2
+    ) +
+    scale_colour_manual(values = fhi_colours) +
+    scale_fill_manual(values = fhi_colours) +
+    scale_x_date(
+      date_breaks = "3 years",
+      date_labels = "%Y",
+      expand = expansion(mult = c(0.01, 0.02))
+    ) +
+    scale_y_continuous(
+      limits = c(0, NA),
+      breaks = pretty_breaks(),
+      expand = expansion(mult = c(0, 0.08))
+    ) +
+    labs(
+      x = NULL,
+      y = "Antall tilfeller per år",
+      colour = "Scenario",
+      fill = "Scenario"
+    )
+
+  if (use_facets) {
+    p <- p +
+      facet_wrap(
+        ~ component,
+        scales = "free_y",
+        nrow = 1
+      )
+  }
+
+  p
+}
+
+p_total <- scenario_plot(
+  observed_data = observed_year_long |>
+    filter(component == "Totalt"),
+  predicted_data = predicted_year_long |>
+    filter(component == "Totalt")
+) +
+  labs(y = "Totalt antall tilfeller per år")
+
+p_components <- scenario_plot(
+  observed_data = observed_year_long |>
+    filter(component != "Totalt"),
+  predicted_data = predicted_year_long |>
+    filter(component != "Totalt"),
+  use_facets = TRUE
+)
+
+p_main <- (
+  p_total /
+    p_components
+) +
+  plot_layout(
+    heights = c(1.45, 1),
+    guides = "collect"
+  ) &
+  theme(
+    legend.position = "bottom",
+    strip.background = element_blank(),
+    panel.border = element_blank()
+  )
+
+print(p_main)
+
+ggsave(
+  filename = paste0(
+    output_path,
+    "CPO_scenarioframskriving_aar.png"
+  ),
+  plot = p_main,
+  width = 12,
+  height = 9,
+  dpi = 300
+)
+```
+
+# Sammenlign CPO i Norge og Danmark med ESBL i urin i Norge
+
+Figuren viser norske og danske CPO-tall sammen med andelen ESBL-produserende E. coli- og K. pneumoniae-isolater fra urin i Norge. I panel to er dansk CPO og norsk ESBL forskjøvet ti år fram i tid, mens norsk CPO og den historiske framskrivingen står på opprinnelig tidspunkt.
+
+```{r norway-denmark-esbl-comparison, fig.width=12, fig.height=9}
+esbl_urine <- read_excel(
+  esbl_path,
+  sheet = "Ark1"
+) |>
+  mutate(
+    year = as.integer(year)
+  ) |>
+  pivot_longer(
+    cols = c(esbl_ecoli, esbl_kpneumoniae),
+    names_to = "organism",
+    values_to = "percent"
+  ) |>
+  mutate(
+    series = recode(
+      organism,
+      esbl_ecoli = "ESBL E. coli, Norge",
+      esbl_kpneumoniae = "ESBL K. pneumoniae, Norge"
+    )
+  )
+
+denmark_cpo <- tibble(
+  year = 2015:2024,
+  cases = c(85, 99, 115, 160, 187, 207, 242, 335, 458, 527),
+  series = "Danmark, observert"
+)
+
+norway_observed <- dat_year_observed |>
+  transmute(
+    year,
+    cases = cpo_modelled_total,
+    series = "Norge, observert"
+  )
+
+norway_fitted <- dat_year_model |>
+  transmute(
+    year,
+    t_year_c,
+    abroad = pmax(
+      predict(
+        m_year_abroad,
+        newdata = pick(everything()),
+        type = "response"
+      ),
+      0.001
+    ),
+    domestic = pmax(
+      predict(
+        m_year_domestic,
+        newdata = pick(everything()),
+        type = "response"
+      ),
+      0.001
+    ),
+    unknown = pmax(
+      predict(
+        m_year_unknown,
+        newdata = pick(everything()),
+        type = "response"
+      ),
+      0.001
+    )
+  ) |>
+  transmute(
+    year,
+    cases = abroad + domestic + unknown,
+    series = "Norge, modelltilpasset"
+  )
+
+norway_projected <- annual_predictions |>
+  filter(scenario == "Historisk fortsettelse") |>
+  transmute(
+    year,
+    cases = total,
+    lower = total_lower,
+    upper = total_upper,
+    series = "Norge, historisk fortsettelse"
+  )
+
+panel_labels <- c(
+  "A",
+  "B"
+)
+
+cpo_panel_data <- bind_rows(
+  bind_rows(
+    norway_observed,
+    norway_fitted,
+    denmark_cpo
+  ) |>
+    mutate(panel = panel_labels[1]),
+  bind_rows(
+    norway_observed,
+    norway_fitted,
+    denmark_cpo |>
+      mutate(year = year + 5)
+  ) |>
+    mutate(panel = panel_labels[2])
+) |>
+  mutate(
+    date = as.Date(paste0(year, "-01-01")),
+    panel = factor(panel, levels = panel_labels)
+  )
+
+projected_panel_data <- bind_rows(
+  norway_projected |>
+    mutate(panel = panel_labels[1]),
+  norway_projected |>
+    mutate(panel = panel_labels[2])
+) |>
+  mutate(
+    date = as.Date(paste0(year, "-01-01")),
+    panel = factor(panel, levels = panel_labels)
+  )
+
+esbl_panel_data <- bind_rows(
+  esbl_urine |>
+    mutate(panel = panel_labels[1]),
+  esbl_urine |>
+    mutate(
+      year = year + 5,
+      panel = panel_labels[2]
+    )
+) |>
+  mutate(
+    date = as.Date(paste0(year, "-01-01")),
+    panel = factor(panel, levels = panel_labels)
+  )
+
+cpo_ymax <- max(
+  c(cpo_panel_data$cases,
+    projected_panel_data$upper
+  ),
+  na.rm = TRUE
+)
+esbl_scale_factor <- cpo_ymax/10
+
+p_country <- ggplot() +
+  geom_ribbon(
+    data = projected_panel_data,
+    aes(
+      x = date,
+      ymin = lower,
+      ymax = upper,
+      group = panel
+    ),
+    fill = fhi_colours[["Historisk fortsettelse"]],
+    alpha = 0.12
+  ) +
+  geom_line(
+    data = cpo_panel_data |>
+      filter(series != "Norge, modelltilpasset"),
+    aes(
+      x = date,
+      y = cases,
+      colour = series,
+      group = interaction(panel, series)
+    ),
+    linewidth = 0.8
+  ) +
+  geom_line(
+    data = cpo_panel_data |>
+      filter(series == "Norge, modelltilpasset"),
+    aes(
+      x = date,
+      y = cases,
+      colour = series,
+      group = interaction(panel, series)
+    ),
+    linewidth = 0.8,
+    linetype = "dashed"
+  ) +
+  geom_line(
+    data = esbl_panel_data,
+    aes(
+      x = date,
+      y = percent * esbl_scale_factor,
+      colour = series,
+      group = interaction(panel, series)
+    ),
+    linewidth = 0.8,
+    linetype = "dotdash"
+  ) +
+  geom_line(
+    data = projected_panel_data,
+    aes(
+      x = date,
+      y = cases,
+      colour = series,
+      group = panel
+    ),
+    linewidth = 2
+  ) +
+  facet_wrap(
+    ~ panel,
+    ncol = 2,
+    scales = "free_x"
+  ) +
+  scale_colour_manual(values = country_colours) +
+  scale_x_date(
+    date_breaks = "3 years",
+    date_labels = "%Y",
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+  scale_y_continuous(
+    name = "Antall CPO-tilfeller per år",
+    limits = c(0, NA),
+    breaks = pretty_breaks(),
+    sec.axis = sec_axis(
+      ~ . / esbl_scale_factor,
+      name = "ESBL-produserende isolater fra urin (%)",
+      breaks = seq(0, 10, 2)
+    )
+  ) +
+  labs(
+    x = NULL,
+    colour = NULL
+  ) +
+  theme(
+    strip.background = element_blank(),
+    panel.border = element_blank(),
+    legend.position = "bottom"
+  )
+
+print(p_country)
+
+ggsave(
+  filename = paste0(
+    output_path,
+    "CPO_Danmark_ESBL_sammenlikning.png"
+  ),
+  plot = p_country,
+  width = 12,
+  height = 9,
+  dpi = 300
+)
+```
+
+# Tabell med årlige framskrivinger
+
+Tabellen viser punktestimater og `r prediction_interval * 100` prosent prediksjonsintervaller for hvert scenario. Befolkningsratene er beregnet etter at modellen har predikert årlige antall.
+
+```{r annual-projection-table}
+annual_projection_table <- annual_predictions |>
+  mutate(
+    abroad_result = paste0(
+      round(abroad),
+      " (",
+      round(abroad_lower),
+      "-",
+      round(abroad_upper),
+      ")"
+    ),
+    domestic_result = paste0(
+      round(domestic),
+      " (",
+      round(domestic_lower),
+      "-",
+      round(domestic_upper),
+      ")"
+    ),
+    unknown_result = paste0(
+      round(unknown),
+      " (",
+      round(unknown_lower),
+      "-",
+      round(unknown_upper),
+      ")"
+    ),
+    total_result = paste0(
+      round(total),
+      " (",
+      round(total_lower),
+      "-",
+      round(total_upper),
+      ")"
+    ),
+    rate_result = paste0(
+      round(total_rate_per_100k, 1),
+      " (",
+      round(rate_lower_per_100k, 1),
+      "-",
+      round(rate_upper_per_100k, 1),
+      ")"
+    )
+  ) |>
+  dplyr::select(
+    scenario,
+    year,
+    abroad_result,
+    domestic_result,
+    unknown_result,
+    total_result,
+    rate_result
+  )
+
+kable(
+  annual_projection_table,
+  col.names = c(
+    "Scenario",
+    "År",
+    "Ervervet i utlandet",
+    "Ervervet i Norge",
+    "Ukjent smittested",
+    "Totalt",
+    "Totalt per 100 000"
+  ),
+  caption = paste0(
+    "Forventet antall CPO-tilfeller per år med ",
+    prediction_interval * 100,
+    " % prediksjonsintervall"
+  )
+)
+```
+
+# Eksporter hovedresultater
+
+Hovedfiguren og årsresultatene lagres i prosjektmappen. Begge figurene og årsresultatene lagres i prosjektmappen.
+
+```{r export-results}
+write_csv2(
+  annual_predictions |>
+    dplyr::select(-simulations),
+  paste0(
+    output_path,
+    "CPO_framskriving_aar_detaljert.csv"
+  )
+)
+
+write_csv2(
+  annual_projection_table,
+  paste0(
+    output_path,
+    "CPO_framskriving_aar.csv"
+  )
+)
+
+write_csv2(
+  future_year,
+  paste0(
+    output_path,
+    "CPO_framskrevne_eksponeringer_aar.csv"
+  )
+)
+```
